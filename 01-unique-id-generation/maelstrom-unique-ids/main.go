@@ -7,7 +7,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"time"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
@@ -31,54 +31,58 @@ const (
 	seqMask   = 0x3FF
 )
 
-// state holds the ENTIRE composed ID so that a single atomic CAS transition
-// makes generating an ID one indivisible step. (A first attempt used two
-// independent atomics - a millisecond watermark and a sequence counter -
-// and the joint state could be observed split-brain style under in-process
-// concurrency, minting duplicates. One state word fixes this.)
+// Per-process generator state. Every Maelstrom node runs the same binary as
+// its own OS process, so each has one memory copy of these variables - that
+// is why cross-process distinctness comes from the node-ordinal bits (and
+// cross-restart distinctness from the millisecond watermark), not from here.
+// But within ONE process the library dispatches one goroutine per message,
+// so concurrent handlers share these variables; the mutex turns the
+// read-modify-write of (millisecond, sequence) into a single indivisible
+// step. The critical section is pure integer arithmetic - microseconds of
+// lock-hold time, invisible against per-request latency budgets.
 //
-// Every successful CAS moves the state strictly forward:
-// the timestamp is never smaller than the previous one, and if it is equal,
-// the sequence increments - so two concurrent calls can never mint the
-// same frames twice.
-var state atomic.Uint64
+// (Earlier revisions: first two independent atomics with a CAS retry - which
+// could commit already-minted frames at sequence-wrap boundaries - then a
+// single packed-atomic CAS loop. A mutex is the simpler, equally correct
+// fit at this traffic level: the shared state is trivially tiny, and plain
+// sequential code under one lock expresses the invariants directly.)
+var (
+	mu     sync.Mutex // guards lastMS and seq
+	lastMS uint64     // highest unix-millisecond minted so far
+	seq    uint64     // sequence consumed within lastMS (1024 IDs per ms)
+)
 
 func nextID(nodeID uint64) uint64 {
-	for {
-		prev := state.Load()
-		if prev == 0 {
-			// Lazy one-time seed.
-			if !state.CompareAndSwap(0, uint64(time.Now().UnixMilli())<<tsShift|nodeID<<nodeShift) {
-				continue
-			}
-			prev = state.Load()
-		}
-		prevTs := prev >> tsShift
-		prevNode := (prev >> nodeShift) & nodeMask
-		prevSeq := prev & seqMask
+	mu.Lock()
+	defer mu.Unlock()
 
-		ts := uint64(time.Now().UnixMilli())
-		if ts < prevTs {
-			// The clock stepped backwards (nemesis/ntp): freeze it at the
-			// highest millisecond already minted so no old frame repeats.
-			ts = prevTs
-		}
-
-		newSeq := prevSeq + 1
-		if newSeq > seqMask {
-			// Sequence exhausted (1024 IDs within one millisecond):
-			// minting advances the embedded timestamp by one step instead.
-			newSeq = 0
-			if ts == prevTs {
-				ts = prevTs + 1
-			}
-		}
-
-		next := ts<<tsShift | prevNode<<nodeShift | newSeq
-		if state.CompareAndSwap(prev, next) {
-			return next
-		}
+	// Lazy one-time seed, on the first call in this process.
+	if lastMS == 0 {
+		lastMS = uint64(time.Now().UnixMilli())
 	}
+
+	now := uint64(time.Now().UnixMilli())
+	if now < lastMS {
+		// The clock stepped backwards (nemesis/ntp): freeze it at the
+		// highest millisecond minted so far so no old frame can repeat.
+		now = lastMS
+	}
+
+	if now > lastMS {
+		// Real time has moved on: restart the sequence in the new frame.
+		seq = 0
+		lastMS = now
+	}
+
+	seq++
+	if seq > seqMask {
+		// 1024 IDs minted inside one millisecond: roll the sequence over
+		// and advance the embedded millisecond instead.
+		seq = 0
+		lastMS++
+	}
+
+	return lastMS<<tsShift | nodeID<<nodeShift | seq
 }
 
 // nodeOrdinal parses "n3" -> 3 from the init message received from Maelstrom.
