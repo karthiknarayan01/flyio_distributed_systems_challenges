@@ -2,9 +2,9 @@
 maelstrom/
 store/
 
-# Build artifacts
-maelstrom-echo/
-maelstrom-unique-ids/
+# Compiled challenge binaries (repo root only; source dirs must stay trackable)
+/maelstrom-echo
+/maelstrom-unique-ids
 
 # Certificates
 *.pem

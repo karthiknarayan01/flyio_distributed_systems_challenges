@@ -19,11 +19,8 @@ import (
 //	[  8 bits := node ordinal (from Maelstrom's init) ]
 //	[ 10 bits := per-node sequence counter            ]
 //
-// The node ordinal guarantees globally disjoint ranges between nodes, and a
-// moving timestamp in the highest bits means a killed-and-restarted node
-// (counter, and all state, fresh to zero) can never re-visit frames it has
-// already used. No coordination of any kind is required to generate an ID,
-// so the service stays totally available during network partitions.
+// The node ordinal keeps node ranges disjoint, the moving timestamp covers
+// process restarts, and generation needs no coordination.
 const (
 	tsShift   = 18 // 44 + 8 + 10 = 62 (fits an int64; MSB stays 0)
 	nodeShift = 10
@@ -31,21 +28,9 @@ const (
 	seqMask   = 0x3FF
 )
 
-// Per-process generator state. Every Maelstrom node runs the same binary as
-// its own OS process, so each has one memory copy of these variables - that
-// is why cross-process distinctness comes from the node-ordinal bits (and
-// cross-restart distinctness from the millisecond watermark), not from here.
-// But within ONE process the library dispatches one goroutine per message,
-// so concurrent handlers share these variables; the mutex turns the
-// read-modify-write of (millisecond, sequence) into a single indivisible
-// step. The critical section is pure integer arithmetic - microseconds of
-// lock-hold time, invisible against per-request latency budgets.
-//
-// (Earlier revisions: first two independent atomics with a CAS retry - which
-// could commit already-minted frames at sequence-wrap boundaries - then a
-// single packed-atomic CAS loop. A mutex is the simpler, equally correct
-// fit at this traffic level: the shared state is trivially tiny, and plain
-// sequential code under one lock expresses the invariants directly.)
+// Per-process generator state, guarded so concurrent handler goroutines
+// serialize on the (millisecond, sequence) update. Cross-process
+// distinctness comes from the node ordinal bits.
 var (
 	mu     sync.Mutex // guards lastMS and seq
 	lastMS uint64     // highest unix-millisecond minted so far
@@ -56,28 +41,26 @@ func nextID(nodeID uint64) uint64 {
 	mu.Lock()
 	defer mu.Unlock()
 
-	// Lazy one-time seed, on the first call in this process.
+	// Lazy one-time seed.
 	if lastMS == 0 {
 		lastMS = uint64(time.Now().UnixMilli())
 	}
 
 	now := uint64(time.Now().UnixMilli())
 	if now < lastMS {
-		// The clock stepped backwards (nemesis/ntp): freeze it at the
-		// highest millisecond minted so far so no old frame can repeat.
+		// Clock stepped backwards: keep the highest minted millisecond.
 		now = lastMS
 	}
 
 	if now > lastMS {
-		// Real time has moved on: restart the sequence in the new frame.
+		// New millisecond: restart the sequence.
 		seq = 0
 		lastMS = now
 	}
 
 	seq++
 	if seq > seqMask {
-		// 1024 IDs minted inside one millisecond: roll the sequence over
-		// and advance the embedded millisecond instead.
+		// 1024 IDs minted in this millisecond: roll over and advance it.
 		seq = 0
 		lastMS++
 	}
@@ -85,24 +68,19 @@ func nextID(nodeID uint64) uint64 {
 	return lastMS<<tsShift | nodeID<<nodeShift | seq
 }
 
-// nodeOrdinal parses "n3" -> 3 from the init message received from Maelstrom.
-// Maelstrom guarantees these suffixes are unique per node. It is resolved
-// once, right after init, and only falls back to hashing the node ID if the
-// name ever deviates from the n<integer> convention.
+// nodeOrdinal parses "n3" -> 3. Falls back to hashing the node ID if it
+// deviates from the n<integer> convention.
 func nodeOrdinal(n *maelstrom.Node) uint64 {
 	if v, err := strconv.ParseUint(strings.TrimPrefix(n.ID(), "n"), 10, 8); err == nil {
 		return v
 	}
-	// Defensive fallback: hash the full node ID (unreachable in practice,
-	// Maelstrom always names nodes n1, n2, ...).
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(n.ID()))
 	return h.Sum64() & nodeMask
 }
 
-// waitForNodeID resolves and caches this node's ordinal. Handler goroutines
-// may race the init handler, so it waits (bounded by the test lifetime)
-// until init has been processed and n.ID() is populated.
+// waitForNodeID waits until the init message has been processed: handler
+// goroutines may race the init handler, so n.ID() may not be populated yet.
 func waitForNodeID(n *maelstrom.Node) uint64 {
 	for n.ID() == "" {
 		time.Sleep(time.Millisecond)
@@ -119,20 +97,15 @@ func main() {
 			return err
 		}
 
-		// Maelstrom's Reply round-trips the body through map[string]any,
-		// where JSON numbers become float64 (53 bits of mantissa). A 64-bit
-		// integer ID cannot survive that trip: adjacent values collapse to
-		// the same float and the checker sees duplicates. Serializing the
-		// ID as a decimal string keeps all 64 bits intact - and the challenge
-		// explicitly allows IDs of any type.
+		// Reply round-trips bodies through map[string]any, where JSON
+		// numbers become float64 (53-bit mantissa); a 64-bit integer ID
+		// would lose bits. Strings survive intact.
 		body["type"] = "generate_ok"
 		body["id"] = strconv.FormatUint(nextID(waitForNodeID(n)), 10)
 
 		return n.Reply(msg, body)
 	})
 
-	// Seed the generator as soon as Maelstrom tells this node who it is,
-	// before the first request can ever be answered.
 	if err := n.Run(); err != nil {
 		log.Fatal(err)
 	}
