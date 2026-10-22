@@ -5,7 +5,6 @@ import (
 	"log"
 	"os"
 	"sync"
-	"time"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
@@ -19,21 +18,10 @@ var (
 	topology map[string][]string
 )
 
-// waitForInit waits until the init message has been applied. It arrives
-// first on stdin, but handler goroutines can race it, so we wait until
-// n.ID() is set. This keeps our replies stamped with the right src.
-func waitForInit(n *maelstrom.Node) {
-	for n.ID() == "" {
-		time.Sleep(time.Millisecond)
-	}
-}
-
 func main() {
 	n := maelstrom.NewNode()
 
 	n.Handle("broadcast", func(msg maelstrom.Message) error {
-		waitForInit(n)
-
 		var body map[string]any
 		if err := json.Unmarshal(msg.Body, &body); err != nil {
 			return err
@@ -48,8 +36,6 @@ func main() {
 	})
 
 	n.Handle("read", func(msg maelstrom.Message) error {
-		waitForInit(n)
-
 		// Copy under the lock so the reply can never race an append.
 		mu.Lock()
 		snapshot := make([]int, len(messages))
@@ -60,8 +46,6 @@ func main() {
 	})
 
 	n.Handle("topology", func(msg maelstrom.Message) error {
-		waitForInit(n)
-
 		var body map[string]any
 		if err := json.Unmarshal(msg.Body, &body); err != nil {
 			return err
