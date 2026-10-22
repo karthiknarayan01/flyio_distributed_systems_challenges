@@ -2,5 +2,9 @@
 maelstrom/
 store/
 
+# Build artifacts
+maelstrom-echo/
+maelstrom-unique-ids/
+
 # Certificates
 *.pem
