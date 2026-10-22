@@ -1,0 +1,6 @@
+# Maelstrom test artifacts
+maelstrom/
+store/
+
+# Certificates
+*.pem
