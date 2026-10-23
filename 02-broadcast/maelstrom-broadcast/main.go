@@ -21,9 +21,6 @@ var (
 	// awaitingAck maps a neighbor id to the numbers we sent it but it has
 	// not acked yet. The sweep keeps re-sending these until the ack comes.
 	awaitingAck = map[string]map[int]struct{}{}
-
-	// topology is our copy of the topology message.
-	topology map[string][]string
 )
 
 // Handlers can run before the init message was applied, and our data is
@@ -91,18 +88,33 @@ func missingFrom(neighbor string, newToUs []int) []int {
 	return missing
 }
 
-// forwardTargets returns who to forward numbers to: our topology row, or
-// every other node when the topology has not arrived yet. Caller holds lock.
-func forwardTargets(sender string) []string {
-	targets := topology[node.ID()]
-	if len(targets) == 0 {
-		for _, id := range node.NodeIDs() {
-			if id != node.ID() && id != sender {
-				targets = append(targets, id)
-			}
+// hubOf returns the node that relays every broadcast in our star
+// topology. Every node picks the same one: the lowest node id.
+func hubOf() string {
+	hub := ""
+	for _, id := range node.NodeIDs() {
+		if hub == "" || id < hub {
+			hub = id
 		}
 	}
-	return targets
+	return hub
+}
+
+// ourNeighbors returns who we forward numbers to. Our network is a star:
+// the hub sends to everyone, each other node only sends to the hub.
+// Every node knows this list by itself, so we ignore the topology
+// Maelstrom suggests.
+func ourNeighbors() []string {
+	if node.ID() == hubOf() {
+		others := []string{}
+		for _, id := range node.NodeIDs() {
+			if id != node.ID() {
+				others = append(others, id)
+			}
+		}
+		return others
+	}
+	return []string{hubOf()}
 }
 
 // markSent adds numbers to a neighbor's awaitingAck set.
@@ -179,7 +191,7 @@ func handleBroadcast(msg maelstrom.Message) error {
 	lock.Lock()
 	fresh := storeNumbers(msg.Src, numbers)
 	sendPlan := map[string][]int{}
-	for _, neighbor := range forwardTargets(msg.Src) {
+	for _, neighbor := range ourNeighbors() {
 		missing := missingFrom(neighbor, fresh)
 		if len(missing) > 0 {
 			sendPlan[neighbor] = missing
@@ -213,31 +225,8 @@ func handleRead(msg maelstrom.Message) error {
 }
 
 func handleTopology(msg maelstrom.Message) error {
-	waitForInit()
-
-	var body map[string]any
-	if err := json.Unmarshal(msg.Body, &body); err != nil {
-		return err
-	}
-
-	if rows, ok := body["topology"].(map[string]any); ok {
-		parsed := map[string][]string{}
-		for id, row := range rows {
-			neighbors := []string{}
-			if list, ok := row.([]any); ok {
-				for _, v := range list {
-					if neighbor, ok := v.(string); ok {
-						neighbors = append(neighbors, neighbor)
-					}
-				}
-			}
-			parsed[id] = neighbors
-		}
-		lock.Lock()
-		topology = parsed
-		lock.Unlock()
-	}
-
+	// Maelstrom still sends its suggested topology; we only ack it and
+	// keep our own star neighbor list.
 	return node.Reply(msg, map[string]any{"type": "topology_ok"})
 }
 
