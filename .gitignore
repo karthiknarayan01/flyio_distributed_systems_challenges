@@ -2,9 +2,13 @@
 maelstrom/
 store/
 
-# Compiled challenge binaries (repo root only; source dirs must stay trackable)
-/maelstrom-echo
-/maelstrom-unique-ids
+# Compiled challenge binaries (source dirs must stay trackable)
+maelstrom-txn
+maelstrom-echo
+maelstrom-unique-ids
+maelstrom-broadcast
+maelstrom-counter
+maelstrom-kafka
 
 # Certificates
 *.pem
