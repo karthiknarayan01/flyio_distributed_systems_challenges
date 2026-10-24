@@ -151,11 +151,13 @@ func sendFrame(neighbor string, numbers []int) {
 	}
 }
 
-// runSweep re-sends, every 500ms, each neighbor's unacked numbers in one
-// batched frame. Under a partition the frame is dropped and the numbers
-// stay in awaitingAck; once the network heals, the ack clears them.
+// runSweep sends all pending, every 120ms: one batched frame per
+// neighbor with everything it has not acked yet. Batched sending keeps
+// the frame and ack count down, and under a partition the frame is
+// dropped and the numbers stay in awaitingAck; once the network heals,
+// the ack clears them.
 func runSweep() {
-	ticker := time.NewTicker(500 * time.Millisecond)
+	ticker := time.NewTicker(120 * time.Millisecond)
 	defer ticker.Stop()
 	for range ticker.C {
 		batches := map[string][]int{}
@@ -199,11 +201,11 @@ func handleBroadcast(msg maelstrom.Message) error {
 	}
 	lock.Unlock()
 
-	// Queue the frame for retry and fire a first send right away.
+	// Queue the numbers for the sweep. No instant send here: collecting
+	// a short window first lets one frame carry several numbers, which
+	// keeps the per-number frame and ack cost down.
 	for neighbor, nums := range sendPlan {
-		neighbor := neighbor
 		markSent(neighbor, nums)
-		sendFrame(neighbor, nums)
 	}
 
 	return node.Reply(msg, map[string]any{"type": "broadcast_ok"})
