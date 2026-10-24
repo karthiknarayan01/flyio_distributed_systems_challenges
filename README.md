@@ -12,7 +12,6 @@ Solutions to the [Fly.io Distributed Systems Challenges](https://fly.io/dist-sys
 | 3 | Grow-Only Counter | [`03-grow-only-counter`](./03-grow-only-counter) | [Grow-Only Counter](https://fly.io/dist-sys/challenges/grow-only-counter/) |
 | 4 | Kafka-Style Log | [`04-kafka-style-log`](./04-kafka-style-log) | [Kafka-Style Log](https://fly.io/dist-sys/challenges/kafka-log/) |
 | 5 | Totally-Available Transactions | [`05-totally-available-transactions`](./05-totally-available-transactions) | [Totally-Available Transactions](https://fly.io/dist-sys/challenges/transactions/) |
-| 6 | Replicated Log | [`06-replicated-log`](./06-replicated-log) | [Totally-Available Replicated Log](https://fly.io/dist-sys/challenges/replicated-log/) |
 
 ## About
 
@@ -24,7 +23,6 @@ Each challenge builds on the previous one and focuses on a core distributed syst
 - **Grow-Only Counter** — a distributed counter with conflict-free convergence.
 - **Kafka-Style Log** — a replicated append-only log service.
 - **Totally-Available Transactions** — a transactional key-value store that stays available during partitions.
-- **Replicated Log** — a linearizable replicated log (Raft territory).
 
 ## Running
 

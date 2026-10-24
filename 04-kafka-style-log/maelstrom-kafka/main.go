@@ -25,13 +25,58 @@ const rpcTimeout = 500 * time.Millisecond
 // peer.
 const retryPause = 10 * time.Millisecond
 
-// flushInterval is how often a log owner copies its changed keys into
-// the store.
-const flushInterval = 250 * time.Millisecond
+func main() {
+	node = maelstrom.NewNode()
+	kv = maelstrom.NewLinKV(node)
 
-// logKey maps a user log name to its store key.
-func logKey(name string) string {
-	return "log:" + name
+	node.Handle("send", handleSend)
+	node.Handle("poll", handlePoll)
+	node.Handle("commit_offsets", handleCommitOffsets)
+	node.Handle("list_committed_offsets", handleListCommittedOffsets)
+
+	go runFlusher()
+
+	if err := node.Run(); err != nil {
+		log.Fatal(err)
+	}
+	os.Exit(0)
+}
+
+func handleSend(msg maelstrom.Message) error {
+	waitForInit()
+
+	var body map[string]any
+	if err := json.Unmarshal(msg.Body, &body); err != nil {
+		return err
+	}
+	name := body["key"].(string)
+
+	// Logs belong to one node; requests for the others are relayed.
+	owner := ownerOf(name)
+	if owner != node.ID() {
+		relayed, err := askOwner(owner, map[string]any{
+			"type": "send",
+			"key":  name,
+			"msg":  body["msg"],
+		})
+		if err != nil {
+			return err
+		}
+		return node.Reply(msg, relayed)
+	}
+
+	return node.Reply(msg, map[string]any{
+		"type":   "send_ok",
+		"offset": appendLocal(name, int(body["msg"].(float64))),
+	})
+}
+
+// waitForInit: ownership picks and relaying both need the node ids and
+// our own id, which arrive in the init message.
+func waitForInit() {
+	for node.ID() == "" {
+		time.Sleep(time.Millisecond)
+	}
 }
 
 // ownerOf returns the node that owns a log: the same pick on every node,
@@ -48,12 +93,38 @@ func fnv32(name string) uint32 {
 	return h.Sum32()
 }
 
-// waitForInit: ownership picks and relaying both need the node ids and
-// our own id, which arrive in the init message.
-func waitForInit() {
-	for node.ID() == "" {
-		time.Sleep(time.Millisecond)
+// askOwner sends one request body to the owning node and answers with
+// its reply body. The loop rides out calls that time out for timing
+// reasons.
+func askOwner(owner string, body any) (map[string]any, error) {
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
+		resp, err := node.SyncRPC(ctx, owner, body)
+		cancel()
+		if err != nil {
+			time.Sleep(retryPause)
+			continue
+		}
+
+		var answer map[string]any
+		if err := json.Unmarshal(resp.Body, &answer); err != nil {
+			return nil, err
+		}
+		return answer, nil
 	}
+}
+
+// appendLocal appends a message to our own log and answers with its
+// offset. Offsets are dense from zero, so a fresh message's offset is
+// the last index, which only grows.
+func appendLocal(name string, value int) int {
+	state := stateFor(name)
+	state.lock.Lock()
+	state.messages = append(state.messages, value)
+	state.dirty = true
+	offset := len(state.messages) - 1
+	state.lock.Unlock()
+	return offset
 }
 
 // logState is one log, kept in the owner's memory. Only the owning node
@@ -86,17 +157,41 @@ func stateFor(name string) *logState {
 	return state
 }
 
-// appendLocal appends a message to our own log and answers with its
-// offset. Offsets are dense from zero, so a fresh message's offset is
-// the last index, which only grows.
-func appendLocal(name string, value int) int {
-	state := stateFor(name)
-	state.lock.Lock()
-	state.messages = append(state.messages, value)
-	state.dirty = true
-	offset := len(state.messages) - 1
-	state.lock.Unlock()
-	return offset
+func handlePoll(msg maelstrom.Message) error {
+	waitForInit()
+
+	var body map[string]any
+	if err := json.Unmarshal(msg.Body, &body); err != nil {
+		return err
+	}
+
+	// One poll may name logs owned by different nodes, so the offsets
+	// are grouped per owner and gathered one group at a time.
+	groups := map[string]map[string]int{}
+	for name, rawOffset := range body["offsets"].(map[string]any) {
+		owner := ownerOf(name)
+		if groups[owner] == nil {
+			groups[owner] = map[string]int{}
+		}
+		groups[owner][name] = int(rawOffset.(float64))
+	}
+
+	out := map[string][][2]int{}
+	for owner, group := range groups {
+		if owner == node.ID() {
+			for name, pairs := range pollLocal(group) {
+				out[name] = pairs
+			}
+			continue
+		}
+		relayed, err := askOwner(owner, map[string]any{"type": "poll", "offsets": group})
+		if err != nil {
+			return err
+		}
+		parsePoll(relayed, out)
+	}
+
+	return node.Reply(msg, map[string]any{"type": "poll_ok", "msgs": out})
 }
 
 // pollLocal answers one group of poll offsets from our own state,
@@ -123,6 +218,50 @@ func pollLocal(group map[string]int) map[string][][2]int {
 	return out
 }
 
+// parsePoll adds an owner's poll answer into out as our pair shape.
+func parsePoll(raw map[string]any, out map[string][][2]int) {
+	for name, value := range raw["msgs"].(map[string]any) {
+		pairs := make([][2]int, 0, len(value.([]any)))
+		for _, item := range value.([]any) {
+			vals := item.([]any)
+			pairs = append(pairs, [2]int{int(vals[0].(float64)), int(vals[1].(float64))})
+		}
+		out[name] = pairs
+	}
+}
+
+func handleCommitOffsets(msg maelstrom.Message) error {
+	waitForInit()
+
+	var body map[string]any
+	if err := json.Unmarshal(msg.Body, &body); err != nil {
+		return err
+	}
+
+	groups := map[string]map[string]int{}
+	for name, rawOffset := range body["offsets"].(map[string]any) {
+		owner := ownerOf(name)
+		if groups[owner] == nil {
+			groups[owner] = map[string]int{}
+		}
+		groups[owner][name] = int(rawOffset.(float64))
+	}
+
+	for owner, group := range groups {
+		if owner == node.ID() {
+			for name, commitTo := range group {
+				commitLocal(name, commitTo)
+			}
+			continue
+		}
+		if _, err := askOwner(owner, map[string]any{"type": "commit_offsets", "offsets": group}); err != nil {
+			return err
+		}
+	}
+
+	return node.Reply(msg, map[string]any{"type": "commit_offsets_ok"})
+}
+
 // commitLocal moves a log's committed marker forward, but only ever
 // upward: a client may commit an offset we already hold.
 func commitLocal(name string, commitTo int) {
@@ -133,6 +272,44 @@ func commitLocal(name string, commitTo int) {
 		state.dirty = true
 	}
 	state.lock.Unlock()
+}
+
+func handleListCommittedOffsets(msg maelstrom.Message) error {
+	waitForInit()
+
+	var body map[string]any
+	if err := json.Unmarshal(msg.Body, &body); err != nil {
+		return err
+	}
+
+	groups := map[string][]string{}
+	for _, raw := range body["keys"].([]any) {
+		name := raw.(string)
+		owner := ownerOf(name)
+		groups[owner] = append(groups[owner], name)
+	}
+
+	out := map[string]int{}
+	for owner, names := range groups {
+		if owner == node.ID() {
+			for name, offset := range committedLocal(names) {
+				out[name] = offset
+			}
+			continue
+		}
+		relayed, err := askOwner(owner, map[string]any{"type": "list_committed_offsets", "keys": names})
+		if err != nil {
+			return err
+		}
+		for name, raw := range relayed["offsets"].(map[string]any) {
+			out[name] = int(raw.(float64))
+		}
+	}
+
+	return node.Reply(msg, map[string]any{
+		"type":    "list_committed_offsets_ok",
+		"offsets": out,
+	})
 }
 
 // committedLocal answers which of the named logs we own are committed,
@@ -149,6 +326,10 @@ func committedLocal(names []string) map[string]int {
 	}
 	return out
 }
+
+// flushInterval is how often a log owner copies its changed logs into
+// the store.
+const flushInterval = 250 * time.Millisecond
 
 // runFlusher copies every changed log we own into the store, all at
 // once every 250ms, with one plain Write per log. A Write is safe
@@ -197,188 +378,7 @@ func runFlusher() {
 	}
 }
 
-// askOwner sends one request body to the owning node and answers with
-// its reply body. The loop rides out calls that time out for timing
-// reasons.
-func askOwner(owner string, body any) (map[string]any, error) {
-	for {
-		ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
-		resp, err := node.SyncRPC(ctx, owner, body)
-		cancel()
-		if err != nil {
-			time.Sleep(retryPause)
-			continue
-		}
-
-		var answer map[string]any
-		if err := json.Unmarshal(resp.Body, &answer); err != nil {
-			return nil, err
-		}
-		return answer, nil
-	}
-}
-
-// parsePoll adds an owner's poll answer into out as our pair shape.
-func parsePoll(raw map[string]any, out map[string][][2]int) {
-	for name, value := range raw["msgs"].(map[string]any) {
-		pairs := make([][2]int, 0, len(value.([]any)))
-		for _, item := range value.([]any) {
-			vals := item.([]any)
-			pairs = append(pairs, [2]int{int(vals[0].(float64)), int(vals[1].(float64))})
-		}
-		out[name] = pairs
-	}
-}
-
-func handleSend(msg maelstrom.Message) error {
-	waitForInit()
-
-	var body map[string]any
-	if err := json.Unmarshal(msg.Body, &body); err != nil {
-		return err
-	}
-	name := body["key"].(string)
-
-	// Logs belong to one node; requests for the others are relayed.
-	owner := ownerOf(name)
-	if owner != node.ID() {
-		relayed, err := askOwner(owner, map[string]any{
-			"type": "send",
-			"key":  name,
-			"msg":  body["msg"],
-		})
-		if err != nil {
-			return err
-		}
-		return node.Reply(msg, relayed)
-	}
-
-	return node.Reply(msg, map[string]any{
-		"type":   "send_ok",
-		"offset": appendLocal(name, int(body["msg"].(float64))),
-	})
-}
-
-func handlePoll(msg maelstrom.Message) error {
-	waitForInit()
-
-	var body map[string]any
-	if err := json.Unmarshal(msg.Body, &body); err != nil {
-		return err
-	}
-
-	// One poll may name logs owned by different nodes, so the offsets
-	// are grouped per owner and gathered one group at a time.
-	groups := map[string]map[string]int{}
-	for name, rawOffset := range body["offsets"].(map[string]any) {
-		owner := ownerOf(name)
-		if groups[owner] == nil {
-			groups[owner] = map[string]int{}
-		}
-		groups[owner][name] = int(rawOffset.(float64))
-	}
-
-	out := map[string][][2]int{}
-	for owner, group := range groups {
-		if owner == node.ID() {
-			for name, pairs := range pollLocal(group) {
-				out[name] = pairs
-			}
-			continue
-		}
-		relayed, err := askOwner(owner, map[string]any{"type": "poll", "offsets": group})
-		if err != nil {
-			return err
-		}
-		parsePoll(relayed, out)
-	}
-
-	return node.Reply(msg, map[string]any{"type": "poll_ok", "msgs": out})
-}
-
-func handleCommitOffsets(msg maelstrom.Message) error {
-	waitForInit()
-
-	var body map[string]any
-	if err := json.Unmarshal(msg.Body, &body); err != nil {
-		return err
-	}
-
-	groups := map[string]map[string]int{}
-	for name, rawOffset := range body["offsets"].(map[string]any) {
-		owner := ownerOf(name)
-		if groups[owner] == nil {
-			groups[owner] = map[string]int{}
-		}
-		groups[owner][name] = int(rawOffset.(float64))
-	}
-
-	for owner, group := range groups {
-		if owner == node.ID() {
-			for name, commitTo := range group {
-				commitLocal(name, commitTo)
-			}
-			continue
-		}
-		if _, err := askOwner(owner, map[string]any{"type": "commit_offsets", "offsets": group}); err != nil {
-			return err
-		}
-	}
-
-	return node.Reply(msg, map[string]any{"type": "commit_offsets_ok"})
-}
-
-func handleListCommittedOffsets(msg maelstrom.Message) error {
-	waitForInit()
-
-	var body map[string]any
-	if err := json.Unmarshal(msg.Body, &body); err != nil {
-		return err
-	}
-
-	groups := map[string][]string{}
-	for _, raw := range body["keys"].([]any) {
-		name := raw.(string)
-		owner := ownerOf(name)
-		groups[owner] = append(groups[owner], name)
-	}
-
-	out := map[string]int{}
-	for owner, names := range groups {
-		if owner == node.ID() {
-			for name, offset := range committedLocal(names) {
-				out[name] = offset
-			}
-			continue
-		}
-		relayed, err := askOwner(owner, map[string]any{"type": "list_committed_offsets", "keys": names})
-		if err != nil {
-			return err
-		}
-		for name, raw := range relayed["offsets"].(map[string]any) {
-			out[name] = int(raw.(float64))
-		}
-	}
-
-	return node.Reply(msg, map[string]any{
-		"type":    "list_committed_offsets_ok",
-		"offsets": out,
-	})
-}
-
-func main() {
-	node = maelstrom.NewNode()
-	kv = maelstrom.NewLinKV(node)
-
-	node.Handle("send", handleSend)
-	node.Handle("poll", handlePoll)
-	node.Handle("commit_offsets", handleCommitOffsets)
-	node.Handle("list_committed_offsets", handleListCommittedOffsets)
-
-	go runFlusher()
-
-	if err := node.Run(); err != nil {
-		log.Fatal(err)
-	}
-	os.Exit(0)
+// logKey maps a user log name to its store key.
+func logKey(name string) string {
+	return "log:" + name
 }

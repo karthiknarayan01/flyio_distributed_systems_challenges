@@ -13,6 +13,50 @@ import (
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
 
+func main() {
+	n := maelstrom.NewNode()
+
+	n.Handle("generate", func(msg maelstrom.Message) error {
+		var body map[string]any
+		if err := json.Unmarshal(msg.Body, &body); err != nil {
+			return err
+		}
+
+		// Reply round-trips bodies through map[string]any, where JSON
+		// numbers become float64 (53-bit mantissa); a 64-bit integer ID
+		// would lose bits. Strings survive intact.
+		body["type"] = "generate_ok"
+		body["id"] = strconv.FormatUint(nextID(waitForNodeID(n)), 10)
+
+		return n.Reply(msg, body)
+	})
+
+	if err := n.Run(); err != nil {
+		log.Fatal(err)
+	}
+	os.Exit(0)
+}
+
+// waitForNodeID waits until the init message has been processed: handler
+// goroutines may race the init handler, so n.ID() may not be populated yet.
+func waitForNodeID(n *maelstrom.Node) uint64 {
+	for n.ID() == "" {
+		time.Sleep(time.Millisecond)
+	}
+	return nodeOrdinal(n)
+}
+
+// nodeOrdinal parses "n3" -> 3. Falls back to hashing the node ID if it
+// deviates from the n<integer> convention.
+func nodeOrdinal(n *maelstrom.Node) uint64 {
+	if v, err := strconv.ParseUint(strings.TrimPrefix(n.ID(), "n"), 10, 8); err == nil {
+		return v
+	}
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(n.ID()))
+	return h.Sum64() & nodeMask
+}
+
 // Bit layout of the 64-bit ID (MSB -> LSB):
 //
 //	[ 44 bits := unix milliseconds at generation ]
@@ -66,48 +110,4 @@ func nextID(nodeID uint64) uint64 {
 	}
 
 	return lastMS<<tsShift | nodeID<<nodeShift | seq
-}
-
-// nodeOrdinal parses "n3" -> 3. Falls back to hashing the node ID if it
-// deviates from the n<integer> convention.
-func nodeOrdinal(n *maelstrom.Node) uint64 {
-	if v, err := strconv.ParseUint(strings.TrimPrefix(n.ID(), "n"), 10, 8); err == nil {
-		return v
-	}
-	h := fnv.New64a()
-	_, _ = h.Write([]byte(n.ID()))
-	return h.Sum64() & nodeMask
-}
-
-// waitForNodeID waits until the init message has been processed: handler
-// goroutines may race the init handler, so n.ID() may not be populated yet.
-func waitForNodeID(n *maelstrom.Node) uint64 {
-	for n.ID() == "" {
-		time.Sleep(time.Millisecond)
-	}
-	return nodeOrdinal(n)
-}
-
-func main() {
-	n := maelstrom.NewNode()
-
-	n.Handle("generate", func(msg maelstrom.Message) error {
-		var body map[string]any
-		if err := json.Unmarshal(msg.Body, &body); err != nil {
-			return err
-		}
-
-		// Reply round-trips bodies through map[string]any, where JSON
-		// numbers become float64 (53-bit mantissa); a 64-bit integer ID
-		// would lose bits. Strings survive intact.
-		body["type"] = "generate_ok"
-		body["id"] = strconv.FormatUint(nextID(waitForNodeID(n)), 10)
-
-		return n.Reply(msg, body)
-	})
-
-	if err := n.Run(); err != nil {
-		log.Fatal(err)
-	}
-	os.Exit(0)
 }

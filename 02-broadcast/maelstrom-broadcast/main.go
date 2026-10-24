@@ -23,160 +23,19 @@ var (
 	awaitingAck = map[string]map[int]struct{}{}
 )
 
-// Handlers can run before the init message was applied, and our data is
-// keyed by node.ID(), so wait until init is done.
-func waitForInit() {
-	for node.ID() == "" {
-		time.Sleep(time.Millisecond)
-	}
-}
+func main() {
+	node = maelstrom.NewNode()
 
-// numbersFromBody pulls the broadcast numbers out of one frame body.
-// Clients send one number under "message"; our retry frames between
-// nodes carry a list under "messages".
-func numbersFromBody(body map[string]any) []int {
-	numbers := []int{}
-	if f, ok := body["message"].(float64); ok {
-		numbers = append(numbers, int(f))
-	}
-	if list, ok := body["messages"].([]any); ok {
-		for _, v := range list {
-			if f, ok := v.(float64); ok {
-				numbers = append(numbers, int(f))
-			}
-		}
-	}
-	return numbers
-}
+	node.Handle("broadcast", handleBroadcast)
+	node.Handle("read", handleRead)
+	node.Handle("topology", handleTopology)
 
-// numberSet returns (and creates) the set for a node id. Caller holds lock.
-func numberSet(id string) map[int]struct{} {
-	set, ok := hasNumbers[id]
-	if !ok {
-		set = map[int]struct{}{}
-		hasNumbers[id] = set
-	}
-	return set
-}
+	go runSweep()
 
-// storeNumbers adds the numbers we have not seen before to our own set,
-// and notes that the sender has all of them (it just sent them to us).
-// It returns the numbers that were new to us. Caller holds lock.
-func storeNumbers(sender string, numbers []int) []int {
-	newToUs := []int{}
-	for _, m := range numbers {
-		numberSet(sender)[m] = struct{}{}
-		if _, seen := numberSet(node.ID())[m]; seen {
-			continue
-		}
-		numberSet(node.ID())[m] = struct{}{}
-		newToUs = append(newToUs, m)
+	if err := node.Run(); err != nil {
+		log.Fatal(err)
 	}
-	return newToUs
-}
-
-// missingFrom returns the numbers from newToUs that the neighbor's set
-// does not have yet. Caller holds lock.
-func missingFrom(neighbor string, newToUs []int) []int {
-	neighborSet := numberSet(neighbor)
-	missing := []int{}
-	for _, m := range newToUs {
-		if _, has := neighborSet[m]; !has {
-			missing = append(missing, m)
-		}
-	}
-	return missing
-}
-
-// hubOf returns the node that relays every broadcast in our star
-// topology. Every node picks the same one: the lowest node id.
-func hubOf() string {
-	hub := ""
-	for _, id := range node.NodeIDs() {
-		if hub == "" || id < hub {
-			hub = id
-		}
-	}
-	return hub
-}
-
-// ourNeighbors returns who we forward numbers to. Our network is a star:
-// the hub sends to everyone, each other node only sends to the hub.
-// Every node knows this list by itself, so we ignore the topology
-// Maelstrom suggests.
-func ourNeighbors() []string {
-	if node.ID() == hubOf() {
-		others := []string{}
-		for _, id := range node.NodeIDs() {
-			if id != node.ID() {
-				others = append(others, id)
-			}
-		}
-		return others
-	}
-	return []string{hubOf()}
-}
-
-// markSent adds numbers to a neighbor's awaitingAck set.
-func markSent(neighbor string, numbers []int) {
-	lock.Lock()
-	set, ok := awaitingAck[neighbor]
-	if !ok {
-		set = map[int]struct{}{}
-		awaitingAck[neighbor] = set
-	}
-	for _, m := range numbers {
-		set[m] = struct{}{}
-	}
-	lock.Unlock()
-}
-
-// sendFrame fires one frame with a list of numbers to a neighbor. The
-// numbers stay in awaitingAck until the neighbor acks; the ack also puts
-// them in the neighbor's set. RPC is async, so we never wait for it here.
-func sendFrame(neighbor string, numbers []int) {
-	err := node.RPC(neighbor,
-		map[string]any{"type": "broadcast", "messages": numbers},
-		func(msg maelstrom.Message) error {
-			lock.Lock()
-			for _, m := range numbers {
-				delete(awaitingAck[neighbor], m)
-				numberSet(neighbor)[m] = struct{}{}
-			}
-			lock.Unlock()
-			return nil
-		})
-	if err != nil {
-		log.Print(err)
-	}
-}
-
-// runSweep sends all pending, every 120ms: one batched frame per
-// neighbor with everything it has not acked yet. Batched sending keeps
-// the frame and ack count down, and under a partition the frame is
-// dropped and the numbers stay in awaitingAck; once the network heals,
-// the ack clears them.
-func runSweep() {
-	ticker := time.NewTicker(120 * time.Millisecond)
-	defer ticker.Stop()
-	for range ticker.C {
-		batches := map[string][]int{}
-		lock.Lock()
-		for neighbor, set := range awaitingAck {
-			if len(set) == 0 {
-				continue
-			}
-			numbers := []int{}
-			for m := range set {
-				numbers = append(numbers, m)
-			}
-			batches[neighbor] = numbers
-		}
-		lock.Unlock()
-		for neighbor, numbers := range batches {
-			sendFrame(neighbor, numbers)
-		}
-	}
+	os.Exit(0)
 }
 
 func handleBroadcast(msg maelstrom.Message) error {
@@ -211,6 +70,113 @@ func handleBroadcast(msg maelstrom.Message) error {
 	return node.Reply(msg, map[string]any{"type": "broadcast_ok"})
 }
 
+// waitForInit: our data is keyed by node.ID(), so wait until init is done.
+func waitForInit() {
+	for node.ID() == "" {
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// numbersFromBody pulls the broadcast numbers out of one frame body.
+// Clients send one number under "message"; our retry frames between
+// nodes carry a list under "messages".
+func numbersFromBody(body map[string]any) []int {
+	numbers := []int{}
+	if f, ok := body["message"].(float64); ok {
+		numbers = append(numbers, int(f))
+	}
+	if list, ok := body["messages"].([]any); ok {
+		for _, v := range list {
+			if f, ok := v.(float64); ok {
+				numbers = append(numbers, int(f))
+			}
+		}
+	}
+	return numbers
+}
+
+// storeNumbers adds the numbers we have not seen before to our own set,
+// and notes that the sender has all of them (it just sent them to us).
+// It returns the numbers that were new to us. Caller holds lock.
+func storeNumbers(sender string, numbers []int) []int {
+	newToUs := []int{}
+	for _, m := range numbers {
+		numberSet(sender)[m] = struct{}{}
+		if _, seen := numberSet(node.ID())[m]; seen {
+			continue
+		}
+		numberSet(node.ID())[m] = struct{}{}
+		newToUs = append(newToUs, m)
+	}
+	return newToUs
+}
+
+// numberSet returns (and creates) the set for a node id. Caller holds lock.
+func numberSet(id string) map[int]struct{} {
+	set, ok := hasNumbers[id]
+	if !ok {
+		set = map[int]struct{}{}
+		hasNumbers[id] = set
+	}
+	return set
+}
+
+// ourNeighbors returns who we forward numbers to. Our network is a star:
+// the hub sends to everyone, each other node only sends to the hub.
+// Every node knows this list by itself, so we ignore the topology
+// Maelstrom suggests.
+func ourNeighbors() []string {
+	if node.ID() == hubOf() {
+		others := []string{}
+		for _, id := range node.NodeIDs() {
+			if id != node.ID() {
+				others = append(others, id)
+			}
+		}
+		return others
+	}
+	return []string{hubOf()}
+}
+
+// hubOf returns the node that relays every broadcast in our star
+// topology. Every node picks the same one: the lowest node id.
+func hubOf() string {
+	hub := ""
+	for _, id := range node.NodeIDs() {
+		if hub == "" || id < hub {
+			hub = id
+		}
+	}
+	return hub
+}
+
+// missingFrom returns the numbers from newToUs that the neighbor's set
+// does not have yet. Caller holds lock.
+func missingFrom(neighbor string, newToUs []int) []int {
+	neighborSet := numberSet(neighbor)
+	missing := []int{}
+	for _, m := range newToUs {
+		if _, has := neighborSet[m]; !has {
+			missing = append(missing, m)
+		}
+	}
+	return missing
+}
+
+// markSent adds numbers to a neighbor's awaitingAck set.
+func markSent(neighbor string, numbers []int) {
+	lock.Lock()
+	set, ok := awaitingAck[neighbor]
+	if !ok {
+		set = map[int]struct{}{}
+		awaitingAck[neighbor] = set
+	}
+	for _, m := range numbers {
+		set[m] = struct{}{}
+	}
+	lock.Unlock()
+}
+
 func handleRead(msg maelstrom.Message) error {
 	waitForInit()
 
@@ -232,17 +198,50 @@ func handleTopology(msg maelstrom.Message) error {
 	return node.Reply(msg, map[string]any{"type": "topology_ok"})
 }
 
-func main() {
-	node = maelstrom.NewNode()
-
-	node.Handle("broadcast", handleBroadcast)
-	node.Handle("read", handleRead)
-	node.Handle("topology", handleTopology)
-
-	go runSweep()
-
-	if err := node.Run(); err != nil {
-		log.Fatal(err)
+// runSweep sends all pending, every 120ms: one batched frame per
+// neighbor with everything it has not acked yet. Batched sending keeps
+// the frame and ack count down, and under a partition the frame is
+// dropped and the numbers stay in awaitingAck; once the network heals,
+// the ack clears them.
+func runSweep() {
+	ticker := time.NewTicker(120 * time.Millisecond)
+	defer ticker.Stop()
+	for range ticker.C {
+		batches := map[string][]int{}
+		lock.Lock()
+		for neighbor, set := range awaitingAck {
+			if len(set) == 0 {
+				continue
+			}
+			numbers := []int{}
+			for m := range set {
+				numbers = append(numbers, m)
+			}
+			batches[neighbor] = numbers
+		}
+		lock.Unlock()
+		for neighbor, numbers := range batches {
+			sendFrame(neighbor, numbers)
+		}
 	}
-	os.Exit(0)
+}
+
+// sendFrame fires one frame with a list of numbers to a neighbor. The
+// numbers stay in awaitingAck until the neighbor acks; the ack also puts
+// them in the neighbor's set. RPC is async, so we never wait for it here.
+func sendFrame(neighbor string, numbers []int) {
+	err := node.RPC(neighbor,
+		map[string]any{"type": "broadcast", "messages": numbers},
+		func(msg maelstrom.Message) error {
+			lock.Lock()
+			for _, m := range numbers {
+				delete(awaitingAck[neighbor], m)
+				numberSet(neighbor)[m] = struct{}{}
+			}
+			lock.Unlock()
+			return nil
+		})
+	if err != nil {
+		log.Print(err)
+	}
 }
