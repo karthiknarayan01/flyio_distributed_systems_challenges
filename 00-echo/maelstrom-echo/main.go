@@ -1,3 +1,8 @@
+// Command maelstrom-echo answers the echo challenge: whatever body a
+// client sends comes back with its type switched to echo_ok. No state,
+// no other nodes — this one is the hello-world of node-to-node frames,
+// and its only lesson is the reply convention the later challenges
+// build on.
 package main
 
 import (

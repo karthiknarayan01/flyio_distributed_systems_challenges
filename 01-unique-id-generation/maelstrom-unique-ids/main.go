@@ -1,3 +1,12 @@
+// Command maelstrom-unique-ids mints globally unique 64-bit ids with no
+// coordination between nodes.
+//
+// The approach: each node builds its ids locally — unix milliseconds
+// (44 bits) for ordering and restart safety, the node's ordinal from
+// init (8 bits) so whole ranges of ids belong to one node, and a
+// sequence within the millisecond (10 bits) for the ids in between.
+// The id leaves as a string; JSON numbers are float64 and would chip
+// bits off anything wider.
 package main
 
 import (
