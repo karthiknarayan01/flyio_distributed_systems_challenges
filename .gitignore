@@ -2,13 +2,11 @@
 maelstrom/
 store/
 
-# Compiled challenge binaries (source dirs must stay trackable)
-maelstrom-txn
-maelstrom-echo
-maelstrom-unique-ids
-maelstrom-broadcast
-maelstrom-counter
-maelstrom-kafka
+# Compiled challenge binaries (source dirs must stay trackable).
+# Anchored patterns only: a bare name would also match the source
+# directory itself and silently ignore every new file inside it.
+/maelstrom-*
+*/maelstrom-*/maelstrom-*
 
 # Certificates
 *.pem
